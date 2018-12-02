@@ -52,16 +52,18 @@ const (
 )
 
 type Transaction struct {
-	IsOverwinter       bool
-	Version            uint32
-	VersionGroupID     uint32
-	Inputs             []Input
-	Outputs            []Output
-	LockTime           uint32
-	ExpiryHeight       uint32
-	JoinSplits         []JoinSplit
-	JoinSplitPubKey    [32]byte
-	JoinSplitSignature [64]byte
+	IsOverwinter          bool
+	Version               uint32
+	VersionGroupID        uint32
+	Inputs                []Input
+	Outputs               []Output
+	LockTime              uint32
+	ExpiryHeight          uint32
+	ValueBalance          int64
+	TemporaryUnknownValue uint16
+	JoinSplits            []JoinSplit
+	JoinSplitPubKey       [32]byte
+	JoinSplitSignature    [64]byte
 }
 
 // TxHash generates the Hash for the transaction.
@@ -285,6 +287,8 @@ func (t *Transaction) WriteTo(w io.Writer) (n int64, err error) {
 		t.writeOutputs,
 		writeField(t.LockTime),
 		writeIf(t.IsOverwinter, writeField(t.ExpiryHeight)),
+		writeIf(t.Version >= 4, writeField(t.ValueBalance)),
+		writeIf(t.Version >= 4, writeField(t.TemporaryUnknownValue)),
 		writeIf(t.Version >= 2, t.writeJoinSplits),
 		writeIf(t.Version >= 2 && len(t.JoinSplits) > 0, writeBytes(t.JoinSplitPubKey[:])),
 		writeIf(t.Version >= 2 && len(t.JoinSplits) > 0, writeBytes(t.JoinSplitSignature[:])),
