@@ -2,6 +2,7 @@ package zcash
 
 import (
 	"bytes"
+	"log"
 	"sync"
 	"time"
 
@@ -68,7 +69,7 @@ func (ts *TxStore) CheckDoubleSpends(argTx *Transaction) ([]*chainhash.Hash, err
 		for _, argIn := range argTx.Inputs {
 			// iterate through inputs of compTx
 			for _, compIn := range msgTx.Inputs {
-				if outPointsEqual(argIn.PreviousOutPoint, compIn.PreviousOutPoint) && !compTxid.IsEqual(&argTxid) {
+				if OutpointsEqual(argIn.PreviousOutPoint, compIn.PreviousOutPoint) && !compTxid.IsEqual(&argTxid) {
 					// found double spend
 					dubs = append(dubs, &compTxid)
 					break // back to argIn loop
@@ -98,189 +99,6 @@ func (ts *TxStore) PopulateAdrs() error {
 	}
 	ts.addrMutex.Unlock()
 	return nil
-}
-
-// Ingest puts a tx into the DB atomically.  This can result in a
-// gain, a loss, or no result.  Gain or loss in satoshis is returned.
-func (ts *TxStore) Ingest(tx *Transaction, raw []byte, height int32, timestamp time.Time) (uint32, error) {
-	var hits uint32
-	var err error
-	if err := tx.Validate(ts.params); err != nil {
-		return hits, err
-	}
-
-	// Check to see if we've already processed this tx. If so, return.
-	sh, ok := ts.txids[tx.TxHash().String()]
-	if ok && (sh > 0 || (sh == 0 && height == 0)) {
-		return 1, nil
-	}
-
-	// Check to see if this is a double spend
-	doubleSpends, err := ts.CheckDoubleSpends(tx)
-	if err != nil {
-		return hits, err
-	}
-	if len(doubleSpends) > 0 {
-		// First seen rule
-		if height == 0 {
-			return 0, nil
-		} else {
-			// Mark any unconfirmed doubles as dead
-			for _, double := range doubleSpends {
-				ts.markAsDead(*double)
-			}
-		}
-	}
-
-	// Generate PKscripts for all addresses
-	ts.addrMutex.Lock()
-	PKscripts := make([][]byte, len(ts.adrs))
-	for i := range ts.adrs {
-		// Iterate through all our addresses
-		// TODO: This will need to test both segwit and legacy once segwit activates
-		PKscripts[i], err = PayToAddrScript(ts.adrs[i])
-		if err != nil {
-			return hits, err
-		}
-	}
-	ts.addrMutex.Unlock()
-
-	// Iterate through all outputs of this tx, see if we gain
-	cachedSha := tx.TxHash()
-	cb := wallet.TransactionCallback{Txid: cachedSha.String(), Height: height}
-	value := int64(0)
-	matchesWatchOnly := false
-	for i, txout := range tx.Outputs {
-		out := wallet.TransactionOutput{ScriptPubKey: txout.ScriptPubKey, Value: txout.Value, Index: uint32(i)}
-		for _, script := range PKscripts {
-			if bytes.Equal(txout.ScriptPubKey, script) { // new utxo found
-				scriptAddress, _ := ts.extractScriptAddress(txout.ScriptPubKey)
-				ts.keyManager.MarkKeyAsUsed(scriptAddress)
-				newop := wire.OutPoint{
-					Hash:  cachedSha,
-					Index: uint32(i),
-				}
-				newu := wallet.Utxo{
-					AtHeight:     height,
-					Value:        txout.Value,
-					ScriptPubkey: txout.ScriptPubKey,
-					Op:           newop,
-					WatchOnly:    false,
-				}
-				value += newu.Value
-				ts.Utxos().Put(newu)
-				hits++
-				break
-			}
-		}
-		// Now check watched scripts
-		for _, script := range ts.watchedScripts {
-			if bytes.Equal(txout.ScriptPubKey, script) {
-				newop := wire.OutPoint{
-					Hash:  cachedSha,
-					Index: uint32(i),
-				}
-				newu := wallet.Utxo{
-					AtHeight:     height,
-					Value:        txout.Value,
-					ScriptPubkey: txout.ScriptPubKey,
-					Op:           newop,
-					WatchOnly:    true,
-				}
-				ts.Utxos().Put(newu)
-				matchesWatchOnly = true
-			}
-		}
-		cb.Outputs = append(cb.Outputs, out)
-	}
-	utxos, err := ts.Utxos().GetAll()
-	if err != nil {
-		return 0, err
-	}
-	for _, txin := range tx.Inputs {
-		for i, u := range utxos {
-			if outPointsEqual(txin.PreviousOutPoint, u.Op) {
-				st := wallet.Stxo{
-					Utxo:        u,
-					SpendHeight: height,
-					SpendTxid:   cachedSha,
-				}
-				ts.Stxos().Put(st)
-				ts.Utxos().Delete(u)
-				utxos = append(utxos[:i], utxos[i+1:]...)
-				if !u.WatchOnly {
-					value -= u.Value
-					hits++
-				} else {
-					matchesWatchOnly = true
-				}
-
-				in := wallet.TransactionInput{
-					OutpointHash:       u.Op.Hash.CloneBytes(),
-					OutpointIndex:      u.Op.Index,
-					LinkedScriptPubKey: u.ScriptPubkey,
-					Value:              u.Value,
-				}
-				cb.Inputs = append(cb.Inputs, in)
-				break
-			}
-		}
-	}
-
-	// Update height of any stxos
-	if height > 0 {
-		stxos, err := ts.Stxos().GetAll()
-		if err != nil {
-			return 0, err
-		}
-		for _, stxo := range stxos {
-			if stxo.SpendTxid.IsEqual(&cachedSha) {
-				stxo.SpendHeight = height
-				ts.Stxos().Put(stxo)
-				if !stxo.Utxo.WatchOnly {
-					hits++
-				} else {
-					matchesWatchOnly = true
-				}
-				break
-			}
-		}
-	}
-
-	// If hits is nonzero it's a relevant tx and we should store it
-	if hits > 0 || matchesWatchOnly {
-		ts.cbMutex.Lock()
-		txn, err := ts.Txns().Get(tx.TxHash())
-		shouldCallback := false
-		if err != nil {
-			cb.Value = value
-			txn.Timestamp = timestamp
-			shouldCallback = true
-			ts.Txns().Put(raw, tx.TxHash().String(), int(value), int(height), txn.Timestamp, hits == 0)
-			ts.txids[tx.TxHash().String()] = height
-		}
-		// Let's check the height before committing so we don't allow rogue peers to send us a lose
-		// tx that resets our height to zero.
-		if err == nil && txn.Height <= 0 {
-			ts.Txns().UpdateHeight(tx.TxHash(), int(height), txn.Timestamp)
-			ts.txids[tx.TxHash().String()] = height
-			if height > 0 {
-				cb.Value = txn.Value
-				shouldCallback = true
-			}
-		}
-		cb.BlockTime = timestamp
-		if shouldCallback {
-			// Callback on listeners
-			for _, listener := range ts.listeners {
-				listener(cb)
-			}
-		}
-		ts.cbMutex.Unlock()
-		ts.PopulateAdrs()
-		hits++
-	}
-	return hits, err
 }
 
 func (ts *TxStore) markAsDead(txid chainhash.Hash) error {
@@ -345,12 +163,12 @@ func (ts *TxStore) processReorg(lastGoodHeight uint32) error {
 		if txns[i].Height > int32(lastGoodHeight) {
 			txid, err := chainhash.NewHashFromStr(txns[i].Txid)
 			if err != nil {
-				log.Error(err)
+				log.Println(err)
 				continue
 			}
 			err = ts.markAsDead(*txid)
 			if err != nil {
-				log.Error(err)
+				log.Println(err)
 				continue
 			}
 		}
@@ -366,7 +184,7 @@ func (ts *TxStore) extractScriptAddress(script []byte) ([]byte, error) {
 	return addr.ScriptAddress(), nil
 }
 
-func outPointsEqual(a, b wire.OutPoint) bool {
+func OutpointsEqual(a, b wire.OutPoint) bool {
 	if !a.Hash.IsEqual(&b.Hash) {
 		return false
 	}

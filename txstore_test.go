@@ -232,7 +232,7 @@ func TestTxStoreIngestMarksExistingDoubleSpendsAsDead(t *testing.T) {
 	if len(utxos) != 1 {
 		t.Fatalf("Expected 1 utxo to be found, got: %v\n", utxos)
 	}
-	if outpointsEqual(utxos[0].Op, wire.OutPoint{Hash: existingTxn.TxHash(), Index: 0}) {
+	if OutpointsEqual(utxos[0].Op, wire.OutPoint{Hash: existingTxn.TxHash(), Index: 0}) {
 		t.Errorf("Expected old utxo to have been removed")
 	}
 }

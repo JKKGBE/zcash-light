@@ -553,7 +553,7 @@ type Input struct {
 }
 
 func (i Input) IsEqual(other Input) bool {
-	if !outpointsEqual(i.PreviousOutPoint, other.PreviousOutPoint) {
+	if !OutpointsEqual(i.PreviousOutPoint, other.PreviousOutPoint) {
 		return false
 	}
 	if string(i.SignatureScript) != string(other.SignatureScript) {
